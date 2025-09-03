@@ -1,0 +1,42 @@
+<!DOCTYPE html>
+<html>
+<head>
+  <meta charset="UTF-8">
+  <style>
+    #vis.vega-embed {
+      width: 100%;
+      display: flex;
+    }
+
+    #vis.vega-embed details,
+    #vis.vega-embed details summary {
+      position: relative;
+    }
+  </style>
+  <script type="text/javascript" src="https://cdn.jsdelivr.net/npm/vega@5"></script>
+  <script type="text/javascript" src="https://cdn.jsdelivr.net/npm/vega-lite@5.20.1"></script>
+  <script type="text/javascript" src="https://cdn.jsdelivr.net/npm/vega-embed@6"></script>
+</head>
+<body>
+  <div id="vis"></div>
+  <script>
+    (function(vegaEmbed) {
+      var spec = {"config": {"view": {"continuousWidth": 300, "continuousHeight": 300}}, "data": {"name": "data-f6523dfd967d01e473ff365b0d3d2dec"}, "mark": {"type": "bar"}, "encoding": {"color": {"field": "PairsPct", "scale": {"scheme": "viridis"}, "type": "quantitative"}, "tooltip": [{"field": "Rule", "type": "nominal"}, {"field": "Pairs", "format": ",.0f", "type": "quantitative"}, {"field": "PairsPct", "format": ".2f", "type": "quantitative"}, {"field": "UniqueRecords", "format": ",.0f", "type": "quantitative"}, {"field": "AvgBlockSize", "format": ".2f", "type": "quantitative"}], "x": {"field": "Rule", "sort": "-y", "title": "Blocking Rule", "type": "nominal"}, "y": {"field": "PairsPct", "title": "Candidate Pairs (%)", "type": "quantitative"}}, "height": 400, "title": "High-Performance Blocking Rules by % of Candidate Pairs", "width": 600, "$schema": "https://vega.github.io/schema/vega-lite/v5.20.1.json", "datasets": {"data-f6523dfd967d01e473ff365b0d3d2dec": [{"Rule": "Fuzzy_Phone", "Pairs": 185, "UniqueRecords": 117, "AvgBlockSize": 3.1623931623931623, "PairsPct": 54.252199413489734}, {"Rule": "Fuzzy_Email", "Pairs": 156, "UniqueRecords": 114, "AvgBlockSize": 2.736842105263158, "PairsPct": 45.747800586510266}]}};
+      var embedOpt = {"mode": "vega-lite"};
+
+      function showError(el, error){
+          el.innerHTML = ('<div style="color:red;">'
+                          + '<p>JavaScript Error: ' + error.message + '</p>'
+                          + "<p>This usually means there's a typo in your chart specification. "
+                          + "See the javascript console for the full traceback.</p>"
+                          + '</div>');
+          throw error;
+      }
+      const el = document.getElementById('vis');
+      vegaEmbed("#vis", spec, embedOpt)
+        .catch(error => showError(el, error));
+    })(vegaEmbed);
+
+  </script>
+</body>
+</html>
