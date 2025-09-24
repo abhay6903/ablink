@@ -1,0 +1,716 @@
+# app.py
+
+from __future__ import annotations
+import os
+import threading
+import time
+import uuid
+import json
+import random
+import traceback
+from typing import Dict, Any, List, Tuple
+from functools import reduce
+import numpy as np
+from flask import Flask, request, jsonify, send_file, render_template
+from flask import Response
+import pandas as pd
+import glob
+import shutil
+# FINAL FIX: Import the Path object from pathlib
+from pathlib import Path
+from datasketch import MinHash, MinHashLSH
+try:
+    from rapidfuzz import fuzz as rf_fuzz
+except Exception:
+    rf_fuzz = None
+
+# --- Spark Integration: Use Spark as the primary backend ---
+try:
+    from pyspark import SparkConf, SparkContext
+    from pyspark.sql import SparkSession, DataFrame
+    from pyspark.sql.functions import monotonically_increasing_id, col, lower, regexp_replace, trim, when, split, element_at, upper, lit
+    from pyspark.sql.types import StringType
+    from pyspark.sql.functions import udf
+except ImportError:
+    SparkSession, DataFrame, SparkConf, SparkContext = None, None, None, None
+    # Define placeholder for udf decorator if pyspark is not installed
+    def udf(f=None, returnType=None):
+        def decorator(fn):
+            return fn
+        return decorator if f is None else decorator(f)
+# --- End Spark Integration ---
+
+# External deps expected: trino, duckdb, splink
+try:
+    import trino
+except Exception:  # pragma: no cover
+    trino = None
+
+try:
+    import duckdb
+except Exception:  # pragma: no cover
+    duckdb = None
+
+from splink import Linker, DuckDBAPI
+from splink.backends.spark import SparkAPI, similarity_jar_location
+from splink.exploratory import profile_columns
+try:
+    import altair as alt  # For Altair chart handling from Splink explorers
+except Exception:  # pragma: no cover
+    alt = None
+import plotly.io as pio
+
+import auto_blocking as ab
+from metaphone import doublemetaphone
+try:
+    from unidecode import unidecode
+except ImportError:
+    unidecode = None
+
+
+# --- Metaphone UDF for Spark ---
+def metaphone_py(s: str) -> str:
+    if not s:
+        return ""
+    return doublemetaphone(s)[0]
+
+metaphone_udf = udf(metaphone_py, StringType())
+
+def unidecode_py(s: str) -> str:
+    if not s or not unidecode:
+        return s
+    return unidecode(s)
+
+unidecode_udf = udf(unidecode_py, StringType())
+
+
+app = Flask(__name__, template_folder="templates", static_folder="static")
+
+# ---------------- In-memory job store for progress and artifacts ----------------
+jobs: Dict[str, Dict[str, Any]] = {}
+current_session_id: str | None = None
+
+def _get_trino_connection(host: str, port: int, user: str, catalog: str, http_scheme: str):
+    if trino is None:
+        raise RuntimeError("Python package 'trino' not installed")
+    return trino.dbapi.connect(
+        host=host,
+        port=port,
+        user=user,
+        catalog=catalog,
+        http_scheme=http_scheme,
+    )
+
+def _fetch_table_full(conn, schema: str, table: str) -> pd.DataFrame:
+    query = f"SELECT * FROM {schema}.{table}"
+    return pd.read_sql(query, conn)
+
+def _purge_outputs_dir():
+    out_dir = os.path.join(os.path.dirname(__file__), "outputs")
+    checkpoint_dir = os.path.join(os.path.dirname(__file__), "tmp_checkpoints")
+    for d in [out_dir, checkpoint_dir]:
+        if not os.path.isdir(d):
+            continue
+        for path in glob.glob(os.path.join(d, "*")):
+            try:
+                if os.path.isfile(path):
+                    os.remove(path)
+                elif os.path.isdir(path):
+                    shutil.rmtree(path)
+            except Exception as e:
+                print(f"Warning: could not remove path {path}. Reason: {e}")
+
+@app.post("/reset")
+def reset_server_state():
+    """Clear outputs folder and reset in-memory job/session state."""
+    try:
+        _purge_outputs_dir()
+        jobs.clear()
+        global current_session_id
+        current_session_id = None
+        return jsonify({"ok": True})
+    except Exception as e:
+        return jsonify({"ok": False, "error": str(e)}), 500
+
+def validate_schema_and_tables(host: str, port: int, user: str, catalog: str, http_scheme: str,
+                               schema: str, tables: List[str]) -> bool:
+    try:
+        conn = _get_trino_connection(host, port, user, catalog, http_scheme)
+        cur = conn.cursor()
+        cur.execute(f"SHOW SCHEMAS IN {catalog}")
+        schemas = [r[0] for r in cur.fetchall()]
+        if schema not in schemas:
+            return False
+        cur.execute(f"SHOW TABLES IN {catalog}.{schema}")
+        available = [r[0] for r in cur.fetchall()]
+        invalid = [t for t in tables if t not in available]
+        return len(invalid) == 0
+    except Exception:
+        return False
+
+def preprocess_data_spark(df: DataFrame) -> DataFrame:
+    """Notebook parity: minimal preprocessing (drop rows with missing values) using Spark."""
+    if DataFrame is None:
+        raise RuntimeError("PySpark is not installed, cannot perform Spark operations.")
+    return df.dropna()
+
+def _pick_cols(df: pd.DataFrame, roles: Dict[str, str]) -> List[str]:
+    preferred = []
+    for col_name in [
+        "full_name", "full_name_norm",
+        roles.get("full_name", ""),
+        "first_name_norm", "last_name_norm",
+        roles.get("first_name", ""), roles.get("last_name", "")
+    ]:
+        if col_name and col_name in df.columns:
+            preferred.append(col_name)
+    for col_name in [
+        "address_norm", roles.get("address", ""),
+        "city_norm", roles.get("city", ""),
+        "state_norm", roles.get("state", ""),
+        "zip_norm", roles.get("zip", "")
+    ]:
+        if col_name and col_name in df.columns:
+            preferred.append(col_name)
+    for col_name in ["email_norm", roles.get("email", ""), "phone_digits", roles.get("phone", "")]:
+        if col_name and col_name in df.columns:
+            preferred.append(col_name)
+    if not preferred:
+        other = [c for c in df.columns if c not in ["unique_id", "cluster_id"]]
+        preferred = df[other].select_dtypes(include=["object", "string"]).columns.tolist()
+    seen = set()
+    ordered = []
+    for c in preferred:
+        if c not in seen:
+            seen.add(c)
+            ordered.append(c)
+    return ordered
+
+# MODIFIED FUNCTION 1
+def _run_dedupe_job(job_id: str, creds: Dict[str, Any], schema: str, table: str):
+    jobs[job_id]["status"] = "running"
+    jobs[job_id]["progress"] = 5
+    out_dir = os.path.join(os.path.dirname(__file__), "outputs")
+    os.makedirs(out_dir, exist_ok=True)
+    
+    spark = None
+    try:
+        if SparkSession is None:
+            raise RuntimeError("PySpark is not installed.")
+
+        # --- Configure SparkSession (Robust Method for Windows) ---
+        print("--- Initializing Spark Session for Splink Job ---")
+        
+        jar_path = similarity_jar_location()
+        print(f"Splink UDF JAR path found at: {jar_path}")
+
+        if not jar_path or not os.path.exists(jar_path):
+            error_msg = f"CRITICAL: Splink Scala UDF JAR not found at the expected path: {jar_path}. The job will fail."
+            print(error_msg)
+            raise FileNotFoundError(error_msg)
+        else:
+            print("Splink UDF JAR file confirmed to exist.")
+
+        # ---- THE FIX: Configure spark.jars and spark.jars.packages directly ----
+        # This is more reliable than setting the PYSPARK_SUBMIT_ARGS environment variable.
+        conf = SparkConf()
+        conf.set("spark.driver.memory", "4g")
+        conf.set("spark.executor.memory", "4g")
+        conf.set("spark.sql.codegen.wholeStage", "false")
+        conf.set("spark.jars", jar_path) # Directly tells Spark to load the Splink UDFs
+        conf.set("spark.jars.packages", "io.trino:trino-jdbc:460") # Loads the Trino JDBC driver from Maven
+        
+        spark = SparkSession.builder \
+            .config(conf=conf) \
+            .appName(f"SplinkDedupeJob-{job_id}") \
+            .getOrCreate()
+        
+        print("SparkSession created successfully with Splink UDFs and Trino driver.")
+        
+        checkpoint_dir = os.path.join(os.path.dirname(__file__), "tmp_checkpoints")
+        os.makedirs(checkpoint_dir, exist_ok=True)
+        spark.sparkContext.setCheckpointDir(checkpoint_dir)
+        spark.sparkContext.setLogLevel("ERROR")
+        print("Spark checkpoint directory and log level configured.")
+            
+        jdbc_url = f"jdbc:trino://{creds['host']}:{creds['port']}/{creds['catalog']}"
+        query = f"SELECT * FROM {creds['catalog']}.{schema}.{table}"
+        
+        df_spark = spark.read.format("jdbc") \
+            .option("url", jdbc_url) \
+            .option("query", query) \
+            .option("user", creds["user"]) \
+            .option("driver", "io.trino.jdbc.TrinoDriver") \
+            .load()
+        jobs[job_id]["progress"] = 15
+
+        processed_spark_df = preprocess_data_spark(df_spark)
+        processed_spark_df = processed_spark_df.withColumn("unique_id", monotonically_increasing_id().cast("string"))
+        jobs[job_id]["progress"] = 25
+        
+        db_api = SparkAPI(spark_session=spark)
+        
+        settings_dict, roles, diagnostics, deterministic_rules, df_enhanced_spark = ab.auto_generate_settings(
+            processed_spark_df, db_api=db_api
+        )
+        jobs[job_id]["progress"] = 35
+        
+        roles_path = os.path.join(out_dir, f"roles_{job_id}.json")
+        with open(roles_path, "w", encoding="utf-8") as f:
+            json.dump(roles, f)
+        
+        full_data_path = os.path.join(out_dir, f"full_data_{job_id}.parquet")
+        df_enhanced_spark.write.mode("overwrite").parquet(full_data_path)
+        jobs[job_id]["progress"] = 45
+
+        row_count = df_enhanced_spark.count()
+        sample_df_spark = df_enhanced_spark.sample(fraction=min(1.0, 5000 / row_count if row_count > 0 else 1.0), seed=42)
+        sample_path = os.path.join(out_dir, f"sample_{job_id}.parquet")
+        sample_df_spark.write.mode("overwrite").parquet(sample_path)
+        
+        print("Starting Splink model training...")
+        linker = Linker(df_enhanced_spark, settings_dict, db_api=db_api)
+        
+        random.seed(42)
+        np.random.seed(42)
+        
+        blocking_rules = settings_dict.get("blocking_rules_to_generate_predictions", []) or []
+        try:
+            linker.training.estimate_probability_two_random_records_match(
+                [r.get("blocking_rule") for r in blocking_rules if isinstance(r, dict)], 
+                deterministic_matching_rules=deterministic_rules,
+                recall=0.95
+            )
+        except Exception as e:
+            print(f"Warning: Could not estimate probability of match. {e}")
+
+        print("Running estimate_u_using_random_sampling...")
+        linker.training.estimate_u_using_random_sampling(max_pairs=2_000_000)
+        print("estimate_u_using_random_sampling completed.")
+
+        for br in settings_dict.get("blocking_rules_to_generate_predictions", []):
+            try:
+                linker.training.estimate_parameters_using_expectation_maximisation(blocking_rule=br.get("blocking_rule"))
+            except Exception:
+                pass
+        
+        model_path = os.path.join(out_dir, f"trained_model_{job_id}.json")
+        linker.misc.save_model_to_json(model_path, overwrite=True)
+        jobs[job_id]["progress"] = 70
+
+        df_predictions = linker.inference.predict()
+        cluster_threshold = 0.99
+        try:
+            if row_count < 1000: cluster_threshold = 0.85
+            elif row_count < 5000: cluster_threshold = 0.9
+        except Exception: pass
+        
+        clusters = linker.clustering.cluster_pairwise_predictions_at_threshold(df_predictions, threshold_match_probability=cluster_threshold)
+
+        cluster_mapping = clusters.select("unique_id", "cluster_id")
+        full_df_with_clusters_spark = df_enhanced_spark.join(cluster_mapping, on="unique_id", how="left")
+        full_df_with_clusters_spark = full_df_with_clusters_spark.withColumn(
+            "cluster_id",
+            when(col("cluster_id").isNull(), col("unique_id")).otherwise(col("cluster_id"))
+        )
+        
+        clusters_path = os.path.join(out_dir, f"splink_clusters_{job_id}.parquet")
+        full_df_with_clusters_spark.write.mode("overwrite").parquet(clusters_path)
+        
+        preds_path = os.path.join(out_dir, f"splink_predictions_{job_id}.parquet")
+        df_predictions.write.mode("overwrite").parquet(preds_path)
+        
+        jobs[job_id]["progress"] = 85
+
+        clusters_df = full_df_with_clusters_spark.toPandas()
+        report_path = os.path.join(out_dir, f"reports_{job_id}.parquet")
+        
+        fp_cols = _pick_cols(clusters_df, roles)
+        if not fp_cols:
+            clusters_df['partition_group'] = 'group_' + (pd.factorize(clusters_df['cluster_id'])[0] + 1).astype(str)
+        else:
+            fp_df = clusters_df[fp_cols].fillna("")
+            clusters_df['fingerprint'] = fp_df.agg(' '.join, axis=1)
+            clusters_df['fingerprint_length'] = clusters_df['fingerprint'].str.len()
+            
+            rep_series = clusters_df.loc[clusters_df['fingerprint'].ne('')].sort_values(
+                by=['cluster_id', 'fingerprint_length'], ascending=[True, False]
+            ).drop_duplicates(subset=['cluster_id'])
+            clusters_df = clusters_df.drop(columns=['fingerprint_length'], errors='ignore')
+            cluster_representatives = pd.Series(
+                rep_series['fingerprint'].values, index=rep_series['cluster_id'].values
+            ).to_dict()
+            unique_clusters = list(cluster_representatives.keys())
+
+            lsh = MinHashLSH(threshold=0.8, num_perm=128)
+            cluster_to_minhash = {}
+            for cid in unique_clusters:
+                text = cluster_representatives.get(cid, '')
+                if not text: continue
+                m = MinHash(num_perm=128)
+                for word in text.split(): m.update(word.encode('utf8'))
+                lsh.insert(cid, m)
+                cluster_to_minhash[cid] = m
+
+            parent = {cid: cid for cid in unique_clusters}
+            def find(c_id):
+                if parent[c_id] == c_id: return c_id
+                parent[c_id] = find(parent[c_id])
+                return parent[c_id]
+            def union(c1_id, c2_id):
+                r1, r2 = find(c1_id), find(c2_id)
+                if r1 != r2: parent[r2] = r1
+
+            for cid in unique_clusters:
+                if cid not in cluster_to_minhash: continue
+                for similar_cid in lsh.query(cluster_to_minhash[cid]):
+                    if similar_cid != cid: union(cid, similar_cid)
+
+            cluster_to_partition_map = {c: find(c) for c in unique_clusters}
+            clusters_df['partition_root'] = clusters_df['cluster_id'].map(cluster_to_partition_map).fillna(clusters_df['cluster_id'])
+            roots = pd.Series(list(set(cluster_to_partition_map.values())))
+            root_to_rep = {r: cluster_representatives.get(r, '') for r in roots}
+            ordered_roots = sorted(roots, key=lambda r: (root_to_rep.get(r, ''), str(r)))
+            root_to_groupnum = {r: i + 1 for i, r in enumerate(ordered_roots)}
+            clusters_df['partition_group'] = 'group_' + clusters_df['partition_root'].map(root_to_groupnum).astype(int).astype(str)
+            clusters_df = clusters_df.drop(columns=['fingerprint', 'partition_root'], errors='ignore')
+
+        cols = clusters_df.columns.tolist()
+        if 'partition_group' in cols and 'cluster_id' in cols:
+            cols.remove('partition_group')
+            cols.insert(cols.index('cluster_id') + 1, 'partition_group')
+            clusters_df = clusters_df[cols]
+
+        clusters_df = clusters_df.sort_values(by=['partition_group', 'cluster_id', 'unique_id'])
+        clusters_df.to_parquet(report_path, index=False)
+        jobs[job_id]["report_path"] = report_path
+        
+        jobs[job_id].update({
+            "status": "completed", "progress": 100,
+            "full_data_path": full_data_path, "sample_path": sample_path,
+            "model_path": model_path, "roles_path": roles_path,
+            "clusters_path": clusters_path, "report_path": report_path
+        })
+    except Exception as e:
+        traceback.print_exc()
+        jobs[job_id]["status"] = "error"
+        jobs[job_id]["error"] = str(e)
+        jobs[job_id]["progress"] = 100
+    finally:
+        if spark:
+            print("Stopping Spark Session.")
+            spark.stop()
+
+# MODIFIED FUNCTION 2
+def _check_record_against_clusters(job_id: str, new_record: Dict[str, Any], threshold: float = 0.95) -> Dict[str, Any]:
+    job = jobs.get(job_id)
+    if not job or job.get("status") != "completed":
+        raise ValueError("Job not found or not completed.")
+
+    paths = ["full_data_path", "model_path", "roles_path", "report_path"]
+    if not all(p in job and os.path.exists(job[p]) for p in paths):
+        raise ValueError("One or more required artifacts for checking are missing.")
+
+    spark = None
+    try:
+        # ---- THE FIX: Apply the same robust configuration here ----
+        jar_path = similarity_jar_location()
+        if not jar_path or not os.path.exists(jar_path):
+            raise FileNotFoundError(f"CRITICAL: Splink Scala UDF JAR not found at the expected path: {jar_path}")
+
+        # Build the Spark session with the JAR configured directly
+        spark_builder = SparkSession.builder.appName(f"SplinkCheckRecord-{job_id}")
+        spark_builder.config("spark.jars", jar_path)
+        
+        spark = spark_builder.getOrCreate()
+        spark.sparkContext.setLogLevel("ERROR")
+        
+        base_df_spark = spark.read.parquet(job["full_data_path"])
+        report_df = pd.read_parquet(job["report_path"])
+        with open(job["model_path"], "r", encoding="utf-8") as f:
+            settings = json.load(f)
+        with open(job["roles_path"], "r", encoding="utf-8") as f:
+            roles = json.load(f)
+
+        linker = Linker(base_df_spark, settings, db_api=SparkAPI(spark_session=spark))
+
+        record_copy = dict(new_record)
+        record_copy["unique_id"] = "new_record_to_check"
+        new_df_pd = pd.DataFrame([record_copy])
+        
+        new_df_pd = ab.ensure_first_last_from_name(new_df_pd)
+        from auto_blocking import ensure_derived_columns_enhanced
+        new_df_pd = ensure_derived_columns_enhanced(new_df_pd, roles)
+
+        new_df = spark.createDataFrame(new_df_pd)
+        for col_name in base_df_spark.columns:
+            if col_name not in new_df.columns:
+                new_df = new_df.withColumn(col_name, lit(None).cast(base_df_spark.schema[col_name].dataType))
+
+        matches = linker.inference.find_matches_to_new_records(new_df)
+        matches_pd = matches.toPandas()
+        
+        if matches_pd.empty:
+            return {"result": "unique"}
+
+        # --- Fuzzy Rescoring Logic ---
+        fuzzy_cols, name_like = [], ["name", "fname", "lname", "first_name", "last_name", "surname"]
+        name_roles = [roles.get(r) for r in name_like if roles.get(r)]
+        fuzzy_cols.extend([f"{c}_norm" for c in name_roles if c and f"{c}_norm" in new_df_pd.columns])
+        other_str_roles = [roles.get(r) for r in ["address", "city", "state"] if roles.get(r)]
+        fuzzy_cols.extend([f"{c}_norm" for c in other_str_roles if c and f"{c}_norm" in new_df_pd.columns])
+        fuzzy_cols = sorted(list(set(c for c in fuzzy_cols if c)))
+        
+        new_record_processed = new_df_pd.iloc[0]
+
+        candidate_ids = matches_pd['unique_id_l'].tolist()
+        candidate_records_pd = base_df_spark.filter(col("unique_id").isin(candidate_ids)).toPandas().set_index("unique_id")
+
+        def get_fuzzy_score(match_row):
+            if not rf_fuzz or not fuzzy_cols: return 0.0
+            match_id = match_row['unique_id_l']
+            if match_id not in candidate_records_pd.index: return 0.0
+            candidate_record = candidate_records_pd.loc[match_id]
+            
+            total_score, total_weight = 0, 0
+            for col_name in fuzzy_cols:
+                new_val = str(new_record_processed.get(col_name, "")).strip() if pd.notna(new_record_processed.get(col_name, "")) else ""
+                candidate_val = str(candidate_record.get(col_name, "")).strip() if pd.notna(candidate_record.get(col_name, "")) else ""
+                if not new_val or not candidate_val: continue
+                score = rf_fuzz.token_set_ratio(new_val, candidate_val)
+                weight = 2.0 if any(n in col_name for n in name_like) else 1.0
+                total_score += score * weight
+                total_weight += weight
+            return (total_score / total_weight) if total_weight > 0 else 0.0
+
+        matches_pd['fuzzy_score'] = matches_pd.apply(get_fuzzy_score, axis=1)
+        boost = (matches_pd['fuzzy_score'] - 85) / 15 * 0.1
+        boost[boost < 0] = 0
+        matches_pd['adjusted_prob'] = (matches_pd['match_probability'] + boost).clip(0, 1.0)
+        
+        adaptive_threshold = threshold
+        try:
+            num_rows = base_df_spark.count()
+            if num_rows < 1000 and adaptive_threshold > 0.85: adaptive_threshold = 0.85
+            elif num_rows < 5000 and adaptive_threshold > 0.9: adaptive_threshold = 0.9
+        except Exception: pass
+        
+        strong_matches = matches_pd[matches_pd["adjusted_prob"] >= adaptive_threshold]
+        potential_matches = matches_pd[(matches_pd["adjusted_prob"] < adaptive_threshold) & (matches_pd["adjusted_prob"] >= 0.75)]
+
+        best_match, result_type = None, "unique"
+        if not strong_matches.empty:
+            best_match = strong_matches.sort_values(by="adjusted_prob", ascending=False).iloc[0]
+            result_type = "duplicate"
+        elif not potential_matches.empty:
+            best_match = potential_matches.sort_values(by="adjusted_prob", ascending=False).iloc[0]
+            result_type = "potential_duplicate"
+        else:
+            return {"result": "unique"}
+            
+        best_match_id = str(best_match.get("unique_id_l"))
+        match_info = report_df[report_df["unique_id"] == best_match_id]
+        
+        if match_info.empty:
+            return {"result": result_type, "cluster_id": "N/A", "partition_group": "N/A", "match_probability": float(best_match.get("adjusted_prob", 0.0))}
+
+        return {
+            "result": result_type,
+            "cluster_id": str(match_info["cluster_id"].iloc[0]),
+            "partition_group": str(match_info["partition_group"].iloc[0]),
+            "match_probability": float(best_match.get("adjusted_prob", 0.0)),
+        }
+    finally:
+        if spark:
+            spark.stop()
+
+
+# --- Flask Routes (No changes needed below this line) ---
+@app.get("/")
+def index():
+    defaults = {
+        "TRINO_HOST": os.getenv("TRINO_HOST", "3.108.199.0"),
+        "TRINO_PORT": int(os.getenv("TRINO_PORT", "32092")),
+        "TRINO_USER": os.getenv("TRINO_USER", "root"),
+        "TRINO_CATALOG": os.getenv("TRINO_CATALOG", "hive"),
+        "TRINO_HTTP_SCHEME": os.getenv("TRINO_HTTP_SCHEME", "http"),
+    }
+    return render_template("index.html", defaults=defaults)
+
+@app.get("/session")
+def get_session():
+    sid = uuid.uuid4().hex[:16]
+    return jsonify({"ok": True, "session_id": sid})
+
+@app.post("/connect")
+def connect_trino():
+    data = request.get_json(force=True)
+    host, port, user, catalog, http_scheme = (
+        data.get("host"), int(data.get("port")), data.get("user"), 
+        data.get("catalog"), data.get("http_scheme")
+    )
+    try:
+        conn = _get_trino_connection(host, port, user, catalog, http_scheme)
+        cur = conn.cursor()
+        cur.execute("SHOW SCHEMAS")
+        schemas = sorted([row[0] for row in cur.fetchall()])
+        return jsonify({"ok": True, "schemas": schemas})
+    except Exception as e:
+        return jsonify({"ok": False, "error": str(e)}), 400
+
+@app.post("/tables")
+def list_tables():
+    data = request.get_json(force=True)
+    host, port, user, catalog, http_scheme, schema = (
+        data.get("host"), int(data.get("port")), data.get("user"),
+        data.get("catalog"), data.get("http_scheme"), data.get("schema")
+    )
+    try:
+        conn = _get_trino_connection(host, port, user, catalog, http_scheme)
+        cur = conn.cursor()
+        cur.execute(f"SHOW TABLES FROM {schema}")
+        tables = sorted([row[0] for row in cur.fetchall()])
+        return jsonify({"ok": True, "tables": tables})
+    except Exception as e:
+        return jsonify({"ok": False, "error": str(e)}), 400
+
+@app.post("/columns")
+def list_columns():
+    data = request.get_json(force=True)
+    host, port, user, catalog, http_scheme, schema, table = (
+        data.get("host"), int(data.get("port")), data.get("user"),
+        data.get("catalog"), data.get("http_scheme"), data.get("schema"), data.get("table")
+    )
+    try:
+        conn = _get_trino_connection(host, port, user, catalog, http_scheme)
+        cur = conn.cursor()
+        cur.execute(f"DESCRIBE {catalog}.{schema}.{table}")
+        rows = cur.fetchall()
+        cols = [{"name": r[0], "type": r[1]} for r in rows if r and r[0]]
+        return jsonify({"ok": True, "columns": cols})
+    except Exception as e:
+        return jsonify({"ok": False, "error": str(e)}), 400
+
+@app.post("/check_record")
+def check_record():
+    data = request.get_json(force=True)
+    job_id = data.get("job_id")
+    new_record = data.get("record") or {}
+    threshold = float(data.get("threshold", 0.95))
+    try:
+        res = _check_record_against_clusters(job_id, new_record, threshold)
+        return jsonify({"ok": True, **res})
+    except Exception as e:
+        traceback.print_exc()
+        return jsonify({"ok": False, "error": str(e)}), 400
+
+@app.post("/run")
+def run_job():
+    data = request.get_json(force=True)
+    creds = {k: data.get(k) for k in ["host", "port", "user", "catalog", "http_scheme"]}
+    schema, table, session_id = data.get("schema"), data.get("table"), data.get("session_id")
+
+    global current_session_id
+    if session_id and session_id != current_session_id:
+        _purge_outputs_dir()
+        current_session_id = session_id
+
+    job_id = uuid.uuid4().hex[:12]
+    jobs[job_id] = {"status": "queued", "progress": 0}
+
+    t = threading.Thread(target=_run_dedupe_job, args=(job_id, creds, schema, table), daemon=True)
+    t.start()
+    return jsonify({"ok": True, "job_id": job_id})
+
+@app.get("/progress/<job_id>")
+def job_progress(job_id: str):
+    job = jobs.get(job_id)
+    if not job:
+        return jsonify({"ok": False, "error": "job not found"}), 404
+    return jsonify({"ok": True, **{k: v for k, v in job.items() if k in ("status", "progress", "error")}})
+
+@app.get("/download/<job_id>")
+def download_clusters(job_id: str):
+    job = jobs.get(job_id)
+    if not job:
+        return jsonify({"ok": False, "error": "job not found"}), 404
+    if job.get("status") != "completed":
+        return jsonify({"ok": False, "error": "job not completed"}), 400
+    path = job.get("clusters_path")
+    if not path or not os.path.exists(path):
+        return jsonify({"ok": False, "error": "clusters file not available"}), 404
+    
+    temp_csv_path = path.replace(".parquet", ".csv")
+    pd.read_parquet(path).to_csv(temp_csv_path, index=False)
+    return send_file(temp_csv_path, as_attachment=True, download_name="clusters.csv")
+
+@app.get("/report/<job_id>")
+def download_report(job_id: str):
+    job = jobs.get(job_id)
+    if not job:
+        return jsonify({"ok": False, "error": "job not found"}), 404
+    if job.get("status") != "completed":
+        return jsonify({"ok": False, "error": "job not completed"}), 400
+    report_path = job.get("report_path")
+    if not report_path or not os.path.exists(report_path):
+        return jsonify({"ok": False, "error": "report file not available"}), 404
+    
+    temp_csv_path = report_path.replace(".parquet", ".csv")
+    pd.read_parquet(report_path).to_csv(temp_csv_path, index=False)
+    return send_file(temp_csv_path, as_attachment=True, download_name="reports.csv")
+
+@app.get("/profile/<job_id>")
+def get_profile(job_id: str):
+    job = jobs.get(job_id)
+    if not job:
+        return jsonify({"ok": False, "error": "job not found"}), 404
+    
+    out_dir = os.path.join(os.path.dirname(__file__), "outputs")
+    profile_path = os.path.join(out_dir, f"value_distribution_{job_id}.html")
+    
+    if os.path.exists(profile_path):
+        with open(profile_path, 'r', encoding='utf-8') as fh:
+            return jsonify({"ok": True, "html": fh.read()})
+    
+    sample_path = job.get("sample_path")
+    if not sample_path or not os.path.exists(sample_path):
+        return jsonify({"ok": False, "error": "profile sample not available"}), 404
+        
+    try:
+        sample_df = pd.read_parquet(sample_path)
+        db_api = DuckDBAPI()
+        figs = profile_columns(sample_df, db_api=db_api)
+        
+        def _fig_to_html(fig):
+            try: return pio.to_html(fig, include_plotlyjs='cdn', full_html=False)
+            except Exception:
+                try: return fig.to_html() if alt else ""
+                except Exception: return ""
+        
+        html = "\n".join(_fig_to_html(f) for f in figs) if isinstance(figs, (list, tuple)) else _fig_to_html(figs)
+        
+        with open(profile_path, 'w', encoding='utf-8') as fh:
+            fh.write(html)
+        job["profile_path"] = profile_path
+        return jsonify({"ok": True, "html": html})
+    except Exception as e:
+        return jsonify({"ok": False, "error": str(e)}), 500
+
+@app.get("/profile_html/<job_id>")
+def get_profile_html(job_id: str):
+    """Return the profile HTML directly for iframe embedding."""
+    job = jobs.get(job_id)
+    if not job:
+        return Response("Job not found", status=404)
+        
+    profile_response = get_profile(job_id)
+    if profile_response.status_code != 200:
+        error_data = profile_response.get_json()
+        return Response(error_data.get("error", "Could not generate profile"), status=profile_response.status_code)
+
+    html = profile_response.get_json().get("html", "")
+    return Response(html, status=200, mimetype='text/html')
+
+if __name__ == "__main__":
+    port = int(os.getenv("PORT", "5000"))
+    app.run(host="0.0.0.0", port=port, debug=True)
