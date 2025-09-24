@@ -1,0 +1,127 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Dedupe</title>
+  <link rel="stylesheet" href="/static/style.css" />
+  <script defer src="/static/app.js"></script>
+</head>
+<body>
+  <header>
+    <button id="themeToggle" aria-label="Toggle theme" title="Toggle theme" class="tooltip" data-tooltip="Switch theme">🌓</button>
+  </header>
+
+  <main>
+    <h1 class="main-title">Zigma Dedupe</h1>
+
+    <section class="connect-box animate-in">
+      <h2>🔗Connect To Dedupe🔗</h2>
+      <form id="connectForm">
+        <div class="row">
+          <label>Host</label>
+          <input type="text" name="host" value="{{ defaults.TRINO_HOST }}" required placeholder="Enter database host" />
+        </div>
+        <div class="row">
+          <label>Port</label>
+          <input type="number" name="port" value="{{ defaults.TRINO_PORT }}" required placeholder="Enter port number" />
+        </div>
+        <div class="row">
+          <label>User</label>
+          <input type="text" name="user" value="{{ defaults.TRINO_USER }}" required placeholder="Enter username" />
+        </div>
+        <div class="row">
+          <label>Catalog</label>
+          <input type="text" name="catalog" value="{{ defaults.TRINO_CATALOG }}" required placeholder="Enter catalog name" />
+        </div>
+        
+        <!-- HTTP Scheme is now a hidden field and not shown to the user -->
+        <input type="hidden" name="http_scheme" value="http" />
+        
+        <button type="submit">
+          <span>🔗</span>
+          Connect to Database
+        </button>
+        <div id="connectStatus" class="status"></div>
+      </form>
+    </section>
+
+    <section class="workflow">
+      <div class="left">
+        <div class="select-box animate-in" id="schemaBox">
+          <label>📊 Schema</label>
+          <input type="text" id="schemaInput" placeholder="Type schema name or select from dropdown" />
+          <select id="schemaSelect">
+            <option value="">-- Connect to see schemas --</option>
+          </select>
+        </div>
+        
+        <div class="select-box animate-in" id="tableBox">
+          <label>🗃️ Table</label>
+          <input type="text" id="tableInput" placeholder="Type table name or select from dropdown" />
+          <select id="tableSelect">
+            <option value="">-- Select schema first --</option>
+          </select>
+        </div>
+
+        <button id="runBtn" disabled class="tooltip" data-tooltip="Connect and select schema/table first">
+          <span>🚀</span>
+          Run Deduplication
+        </button>
+        
+        <div class="row-actions left-actions">
+          <button id="showProfileBtn" class="secondary green" disabled>
+            <span>📈</span>
+            Show Data Profile
+          </button>
+          <button id="resetBtn" class="secondary tooltip" data-tooltip="Clear all data and reset">
+            <span>🔄</span>
+            Reset
+          </button>
+        </div>
+        <div class="wide-panel hidden" id="profileWidePanel">
+          <iframe id="profileFrameWide" src="about:blank" class="wide-iframe"></iframe>
+        </div>
+        
+        <div class="progress hidden" id="progressContainer">
+          <div id="spinner" class="spinner hidden"></div>
+          <div class="bar">
+            <div id="barFill" class="fill" style="width:0%"></div>
+          </div>
+          <div id="pct" style="text-align: center; font-weight: 600; margin-bottom: 8px;">0%</div>
+          <div id="runStatus" class="status"></div>
+        </div>
+      </div>
+
+      <div class="right">
+        <div class="box animate-in">
+          <div id="profileContainer" class="profile hidden">
+            <iframe id="profileFrame" src="about:blank" style="width:100%;height:420px;border:0"></iframe>
+          </div>
+        </div>
+
+        <div class="box animate-in">
+          <h3>🔍 Check for Duplicates</h3>
+          <div id="recordForm" class="record-form">
+            <div class="field">
+              <label>No table selected</label>
+              <input disabled placeholder="Connect and select a table first" />
+            </div>
+          </div>
+          <div class="actions">
+            <button id="checkDuplicateBtn" class="secondary green" disabled>
+              <span>🔍</span>
+              Check Duplicate
+            </button>
+            <button id="downloadLink" class="button disabled">
+              <span>💾</span>
+              Download Results
+            </button>
+          </div>
+          
+        </div>
+      </div>
+    </section>
+  </main>
+</body>
+</html>
